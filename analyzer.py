@@ -10,6 +10,7 @@ import sys
 import json
 import subprocess
 import shutil
+import base64
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,7 +25,6 @@ class PCAPAnalyzer:
         if search_patterns:
             self.search_patterns = [p.encode() if isinstance(p, str) else p for p in search_patterns]
         
-        # Security/vulnerability patterns (always checked)
         self.vuln_patterns = {
             'credentials': [
                 rb'password[:\s=]+[^\s\r\n]{3,}',
@@ -263,8 +263,20 @@ class PCAPAnalyzer:
             return 0
         
         streams = set(line.strip() for line in stdout.split('\n') if line.strip())
+        total_streams = len(streams)
         
-        for stream_id in streams:
+        if total_streams == 0:
+            return 0
+        
+        print(f"    Found {total_streams} streams, extracting...")
+        
+        for idx, stream_id in enumerate(streams, 1):
+            # Progress indicator
+            if total_streams > 10:
+                if idx % max(1, total_streams // 20) == 0 or idx == total_streams:
+                    progress = (idx / total_streams) * 100
+                    print(f"\r    Progress: {idx}/{total_streams} ({progress:.1f}%)", end='', flush=True)
+            
             stdout, _ = self.run_tshark([
                 '-Y', f'tcp.stream eq {stream_id}',
                 '-T', 'fields', '-e', 'data'
@@ -299,8 +311,192 @@ class PCAPAnalyzer:
                 except Exception:
                     pass
         
-        print(f"    Extracted {len(streams)} TCP streams")
-        return len(streams)
+        if total_streams > 10:
+            print()  # New line after progress
+        print(f"    Extracted {total_streams} TCP streams")
+        return total_streams
+    
+    def detect_encodings(self):
+        """Detect various encoding formats in network data"""
+        print("[*] Detecting encoded data...")
+        
+        findings = {
+            'base64': set(),
+            'hex': set(),
+            'url_encoded': set(),
+            'md5': set(),
+            'sha1': set(),
+            'sha256': set(),
+            'jwt': set(),
+            'rot13': set(),
+            'binary': set(),
+        }
+        
+        # Collect all text data
+        all_data = []
+        
+        print("    Collecting data from streams...", end='', flush=True)
+        # From TCP streams
+        streams_dir = self.output_dir / 'tcp_streams'
+        if streams_dir.exists():
+            stream_files = list(streams_dir.glob('*.txt'))
+            for stream_file in stream_files:
+                try:
+                    with open(stream_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if content.strip():
+                            all_data.append((content, f'tcp_streams/{stream_file.name}'))
+                except:
+                    pass
+        print(f" {len(all_data)} files")
+        
+        print("    Collecting data from HTTP objects...", end='', flush=True)
+        # From HTTP objects
+        http_dir = self.output_dir / 'http_objects'
+        http_count = 0
+        if http_dir.exists():
+            for http_file in http_dir.glob('*'):
+                try:
+                    with open(http_file, 'rb') as f:
+                        content = f.read()
+                    # Try to decode as text
+                    try:
+                        text = content.decode('utf-8', errors='ignore')
+                        if text.strip():
+                            all_data.append((text, f'http_objects/{http_file.name}'))
+                            http_count += 1
+                    except:
+                        pass
+                except:
+                    pass
+        print(f" {http_count} files")
+        
+        print(f"    Analyzing {len(all_data)} data sources...")
+        total_data = len(all_data)
+        
+        # Analyze collected data
+        for idx, (content, source) in enumerate(all_data, 1):
+            # Show progress for large datasets
+            if total_data > 20 and idx % max(1, total_data // 10) == 0:
+                progress = (idx / total_data) * 100
+                print(f"\r    Analyzing: {idx}/{total_data} ({progress:.1f}%)", end='', flush=True)
+            
+            # Base64 detection (long strings)
+            base64_matches = re.findall(r'\b[A-Za-z0-9+/]{20,}={0,2}\b', content)
+            for match in base64_matches:
+                if self._is_valid_base64(match):
+                    findings['base64'].add((match[:80], source))
+            
+            # Hex strings (long continuous hex)
+            hex_matches = re.findall(r'\b(?:0x)?([a-fA-F0-9]{32,})\b', content)
+            for match in hex_matches:
+                if len(match) >= 32 and len(match) % 2 == 0:
+                    findings['hex'].add((match[:80], source))
+            
+            # URL encoded
+            if '%' in content and re.search(r'%[0-9a-fA-F]{2}', content):
+                url_encoded = re.findall(r'[^%\s]+(?:%[0-9a-fA-F]{2})+[^%\s]*', content)
+                for match in url_encoded:
+                    if match.count('%') >= 2:
+                        findings['url_encoded'].add((match[:80], source))
+            
+            # Hash detection
+            md5_matches = re.findall(r'\b([a-fA-F0-9]{32})\b', content)
+            for match in md5_matches:
+                findings['md5'].add((match, source))
+            
+            sha1_matches = re.findall(r'\b([a-fA-F0-9]{40})\b', content)
+            for match in sha1_matches:
+                findings['sha1'].add((match, source))
+            
+            sha256_matches = re.findall(r'\b([a-fA-F0-9]{64})\b', content)
+            for match in sha256_matches:
+                findings['sha256'].add((match, source))
+            
+            # JWT detection
+            jwt_matches = re.findall(r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', content)
+            for match in jwt_matches:
+                findings['jwt'].add((match[:100], source))
+            
+            # ROT13 detection (heuristic: mostly letters with suspicious patterns)
+            words = re.findall(r'\b[a-zA-Z]{10,}\b', content)
+            for word in words:
+                if self._might_be_rot13(word):
+                    findings['rot13'].add((word[:80], source))
+            
+            # Binary strings (01 patterns)
+            binary_matches = re.findall(r'\b([01]{16,})\b', content)
+            for match in binary_matches:
+                if len(match) >= 32 and len(match) % 8 == 0:
+                    findings['binary'].add((match[:80], source))
+        
+        if total_data > 20:
+            print()  # New line after progress
+        
+        # Filter and output results
+        results = {}
+        for enc_type, items in findings.items():
+            if items:
+                # Limit to avoid duplicates
+                unique_items = list(items)[:15]
+                results[enc_type] = unique_items
+        
+        if results:
+            total = sum(len(v) for v in results.values())
+            print(f"    Detected {total} encoded patterns\n")
+            
+            try:
+                with open(self.output_dir / 'encoded_data.txt', 'w', encoding='utf-8') as f:
+                    f.write("="*70 + "\n")
+                    f.write("ENCODED DATA DETECTED\n")
+                    f.write("="*70 + "\n")
+                    f.write("\nNote: Some patterns may overlap (e.g., hashes detected as hex)\n")
+                    f.write("Manual verification recommended for cipher detection\n\n")
+                    
+                    for enc_type, items in sorted(results.items()):
+                        if not items:
+                            continue
+                        
+                        print(f"  {enc_type.upper()}: {len(items)} found")
+                        f.write(f"\n{enc_type.upper()} ({len(items)} found):\n")
+                        f.write("-"*70 + "\n")
+                        
+                        for data, source in items:
+                            f.write(f"Source: {source}\n")
+                            f.write(f"Data:   {data}\n\n")
+                
+                print(f"\n  Full report: {self.output_dir / 'encoded_data.txt'}")
+            except IOError as e:
+                print(f"    Warning: Could not write encoded data - {e}")
+        else:
+            print("    No encoded patterns detected")
+        
+        return results
+    
+    def _is_valid_base64(self, s):
+        """Check if string is valid base64"""
+        if len(s) < 20 or len(s) % 4 != 0:
+            return False
+        if not re.match(r'^[A-Za-z0-9+/]+=*$', s):
+            return False
+        try:
+            decoded = base64.b64decode(s)
+            # Check if decoded content has some structure
+            printable = sum(c < 128 for c in decoded)
+            return printable / len(decoded) > 0.5 if decoded else False
+        except:
+            return False
+    
+    def _might_be_rot13(self, word):
+        """Heuristic check if word might be ROT13 encoded"""
+        # Look for words with unusual letter frequency
+        if len(word) < 10:
+            return False
+        
+        vowels = sum(1 for c in word.lower() if c in 'aeiou')
+        vowel_ratio = vowels / len(word)
+        
+        return 0.15 < vowel_ratio < 0.45
     
     def search_user_patterns(self):
         """Search for user-defined patterns across all data"""
@@ -592,7 +788,7 @@ class PCAPAnalyzer:
                 except Exception:
                     pass
         
-        for result_file in ['search_results.txt', 'security_findings.txt', 'credentials.txt']:
+        for result_file in ['search_results.txt', 'security_findings.txt', 'credentials.txt', 'encoded_data.txt']:
             if (self.output_dir / result_file).exists():
                 print(f"  {result_file}: available")
         
@@ -607,7 +803,6 @@ class PCAPAnalyzer:
     
     def run_analysis(self):
         """Execute full analysis"""
-        # Check tshark availability first
         if not self.check_tshark():
             sys.exit(1)
         
@@ -620,6 +815,7 @@ class PCAPAnalyzer:
             self.extract_http_objects()
             self.extract_ftp_data()
             self.extract_images()
+            self.detect_encodings()
             self.search_user_patterns()
             self.check_security()
             self.extract_credentials()
@@ -652,8 +848,10 @@ def main():
         print("  python analyzer.py capture.pcap")
         print("  python analyzer.py capture.pcap -s 'password'")
         print("  python analyzer.py capture.pcap -c FLAG")
+        print("  python analyzer.py capture.pcap -c CJ2025")
         print("  python analyzer.py capture.pcap -f picoCTF -s 'api.key'")
         print("\nNote: CTF patterns automatically search for PREFIX{...} format (complete and incomplete)")
+        print("      Encoding detection (Base64, Hex, Hashes, etc.) is automatic")
         sys.exit(1)
     
     pcap_file = sys.argv[1]
@@ -663,7 +861,6 @@ def main():
         print("Please check the file path and try again.")
         sys.exit(1)
     
-    # Check if file is readable
     try:
         with open(pcap_file, 'rb') as f:
             f.read(1)
@@ -678,14 +875,13 @@ def main():
     while i < len(sys.argv):
         arg = sys.argv[i]
         
-        # CTF pattern shortcuts
+        # CTF pattern 
         if arg in ['-c', '--ctf-pattern', '-f', '--flag-format'] and i + 1 < len(sys.argv):
             prefix = sys.argv[i + 1]
-            # Add both complete and incomplete patterns
             patterns.append(rf'{prefix}\{{[^\}}]+\}}')  # Complete: PREFIX{...}
             patterns.append(rf'{prefix}\{{[^\}}]{{8,}}')  # Incomplete: PREFIX{...
             i += 2
-        # Custom search pattern
+
         elif arg in ['-s', '--search'] and i + 1 < len(sys.argv):
             patterns.append(sys.argv[i + 1])
             i += 2
